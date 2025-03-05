@@ -1,0 +1,76 @@
+# Debug mode - enables detailed logging
+scheduler:
+  debug: false
+
+  # Task defaults
+  tasks:
+    # Maximum number of tasks to run per tick
+    max-per-tick: 50
+    # Maximum number of async tasks to run in parallel
+    max-async-parallel: 16
+    # Default timeout for tasks in milliseconds (0 = no timeout)
+    default-timeout: 0
+
+  # Performance settings
+  performance:
+    # TPS thresholds for adaptive timing
+    # When TPS drops below these thresholds, different levels of delay will be applied
+    tps:
+      optimal: 19.0  # No scaling applied
+      minor-lag: 17.0  # 50% longer delays
+      moderate-lag: 14.0  # Double delays
+      # Below moderate is considered severe (triple delays)
+
+    # Memory thresholds
+    memory:
+      # High memory usage threshold (as percentage)
+      high-threshold: 80
+      # Critical memory usage threshold (as percentage)
+      critical-threshold: 95
+
+    # Resource limits
+    resources:
+      # Maximum concurrent tasks per resource
+      max-concurrent: 8
+      # Database connection limit
+      database-limit: 4
+      # File operation limit
+      file-limit: 8
+      # Network operation limit
+      network-limit: 12
+
+  # Thread pool settings
+  threads:
+    # Size of I/O pool as multiplier of CPU cores (e.g. 4 means 4x CPU cores)
+    io-pool-size: 4
+    # Size of CPU pool as multiplier of CPU cores
+    cpu-pool-size: 1
+    # Low latency pool maximum size
+    low-latency-size: 32
+    # Scheduled pool size
+    scheduled-size: 2
+
+  # Metrics collection settings
+  metrics:
+    # Enable metrics collection
+    enabled: true
+    # Enable detailed task timing
+    detailed-timing: true
+    # Path for metrics export (relative to plugin folder)
+    path: "metrics"
+    # Auto-export interval in minutes (0 to disable)
+    export: false
+    interval: 60
+    # Number of minutes to retain metrics
+    retention: 60
+    # Maximum number of recent executions to track
+    max-recent: 1000
+    # Enable metrics commands
+    commands: true
+
+  # Chain execution settings
+  chains:
+    # Maximum chain depth (to prevent infinite loops)
+    max-depth: 100
+    # Default delay between chain steps in ticks
+    default-delay: 0

@@ -1,0 +1,15 @@
+name: Scheduler
+version: 1.0
+main: me.leon.scheduler.Scheduler
+api-version: 1.19
+description: High-performance task scheduling library for Minecraft plugins
+author: Leon
+commands:
+  scheduler:
+    description: Commands to manage and view scheduler metrics
+    usage: /scheduler <metrics|export|debug>
+    permission: scheduler.admin
+permissions:
+  scheduler.admin:
+    description: Allows access to scheduler commands
+    default: op
