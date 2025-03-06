@@ -32,7 +32,7 @@ Stop guessing which tasks are causing lag! The built-in metrics system tracks ex
 ## 💡 What Makes It Different?
 
 | Feature | Bukkit Scheduler | SchedulerX |
-|---------|------------------|---------------|
+|---------|-----------------|------------|
 | Sync/Async Tasks | ✅ | ✅ |
 | Delayed/Repeating Tasks | ✅ | ✅ |
 | Task Chaining | ❌ | ✅ |
@@ -43,6 +43,16 @@ Stop guessing which tasks are causing lag! The built-in metrics system tracks ex
 | Performance Metrics | ❌ | ✅ |
 | Object Pooling | ❌ | ✅ |
 | HTML/CSV Metrics Export | ❌ | ✅ |
+| Dynamic Thread Pool Management | ❌ | ✅ |
+| Hot Path Optimization | ❌ | ✅ |
+| Task Locality Awareness | ❌ | ✅ |
+| Task Checkpointing & Recovery | ❌ | ✅ |
+| Plugin-Aware Resource Balancing | ❌ | ✅ |
+| Predictive Scheduling | ❌ | ✅ |
+| Task Coalescing | ❌ | ✅ |
+| Plugin Hibernation Detection | ❌ | ✅ |
+| Memory-Conscious Scheduling | ❌ | ✅ |
+| Smart Task Cancellation | ❌ | ✅ |
 
 ## 📋 Usage
 
@@ -72,6 +82,43 @@ scheduler.runLater(() -> {
 scheduler.runTimer(() -> {
     updateScoreboard();
 }, 20, 20); // 1 second delay, update every second
+
+// Chain multiple tasks together
+scheduler.chain()
+    .async(() -> loadPlayerData(player))
+    .sync(data -> updatePlayerInventory(player, data))
+    .delay(20) // Wait 1 second
+    .async(() -> savePlayerData(player))
+    .execute();
+
+// Run task only when condition is met
+scheduler.runWhen(
+    () -> player.isOnline() && !player.isDead(),
+    () -> givePlayerReward(player)
+);
+
+// Run task only when server TPS is healthy
+scheduler.runWhenHealthy(() -> {
+    generateNewStructures();
+}, 18.0); // Only run when TPS is above 18
+
+// Run with resource lock to prevent overloading
+scheduler.runWithResource(
+    () -> executeDatabaseQuery(),
+    "database"
+);
+
+// Run task with specific priority
+scheduler.runPrioritized(
+    () -> processPlayerMovement(),
+    Priority.HIGH
+);
+
+// Run resource-intensive task in most efficient way
+scheduler.runEfficient(() -> {
+    // This will run when the server isn't lagging
+    generateChunks();
+});
 ```
 
 ### Advanced Features
@@ -108,6 +155,42 @@ scheduler.runPrioritized(
     () -> processPlayerMovement(),
     Priority.HIGH
 );
+
+// Group tasks that operate on the same data
+scheduler.runWithLocality(
+    () -> processChunkData(chunk), 
+    "chunk:" + chunk.getX() + "," + chunk.getZ()
+);
+
+// Combine similar small tasks to reduce overhead
+scheduler.runCoalesced(
+    () -> updatePlayerScore(player),
+    "player-score-updates"
+);
+
+// Create resumable task that can be interrupted
+Runnable checkpointableTask = scheduler.createCheckpointableTask(
+    taskId,
+    () -> initialState(),
+    state -> processStateAndReturnNewState(state)
+);
+scheduler.runAsync(checkpointableTask);
+
+// Complex tasks with multiple processing stages
+Runnable multiStageTask = scheduler.taskCheckpointing.createMultiStageTask(
+    taskId,
+    TaskCheckpointing.createStageProcessor(() -> initialData(), (data, checkpoint) -> {
+        // Stage 1: Process data
+        DataResult result = processData(data);
+        checkpoint.accept(result);
+        return result;
+    }),
+    TaskCheckpointing.createStageProcessor(null, (result, checkpoint) -> {
+        // Stage 2: Use the result from stage 1
+        return finalizeResult(result);
+    })
+);
+scheduler.runAsync(multiStageTask);
 ```
 
 ## 🔧 Installation
