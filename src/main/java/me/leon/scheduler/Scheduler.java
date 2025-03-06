@@ -1,8 +1,11 @@
 package me.leon.scheduler;
 
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.logging.Level;
 
@@ -19,16 +22,23 @@ import me.leon.scheduler.core.MemoryMonitor;
 import me.leon.scheduler.core.TPSMonitor;
 import me.leon.scheduler.core.TaskManager;
 import me.leon.scheduler.core.ThreadPoolManager;
+import me.leon.scheduler.core.ThreadPoolOrchestrator;
 import me.leon.scheduler.execution.AsyncExecutor;
 import me.leon.scheduler.execution.BatchExecutor;
 import me.leon.scheduler.execution.ExecutionStrategy;
 import me.leon.scheduler.execution.SyncExecutor;
+import me.leon.scheduler.execution.TaskCheckpointing;
 import me.leon.scheduler.metrics.MetricsExporter;
 import me.leon.scheduler.metrics.SchedulerMetrics;
 import me.leon.scheduler.metrics.TaskTracker;
 import me.leon.scheduler.optimization.AdaptiveTiming;
+import me.leon.scheduler.optimization.HotPathOptimizer;
 import me.leon.scheduler.optimization.LoadBalancer;
 import me.leon.scheduler.optimization.ObjectPool;
+import me.leon.scheduler.optimization.PluginAwareBalancer;
+import me.leon.scheduler.optimization.PredictiveScheduler;
+import me.leon.scheduler.optimization.TaskCoalescer;
+import me.leon.scheduler.optimization.TaskLocalityOptimizer;
 import me.leon.scheduler.optimization.TaskPrioritizer;
 import me.leon.scheduler.optimization.TaskPrioritizer.Priority;
 import me.leon.scheduler.util.Debug;
@@ -46,6 +56,7 @@ public final class Scheduler {
     // Core components
     private final TaskManager taskManager;
     private final ThreadPoolManager threadPoolManager;
+    private final ThreadPoolOrchestrator threadPoolOrchestrator;
     private final TPSMonitor tpsMonitor;
     private final MemoryMonitor memoryMonitor;
 
@@ -61,6 +72,12 @@ public final class Scheduler {
     private final TaskPrioritizer taskPrioritizer;
     private final LoadBalancer loadBalancer;
     private final AdaptiveTiming adaptiveTiming;
+    private final HotPathOptimizer hotPathOptimizer;
+    private final TaskLocalityOptimizer localityOptimizer;
+    private final PluginAwareBalancer pluginBalancer;
+    private final TaskCheckpointing taskCheckpointing;
+    private final PredictiveScheduler predictiveScheduler;
+    private final TaskCoalescer taskCoalescer;
 
     // Metrics components
     private final SchedulerMetrics schedulerMetrics;
@@ -82,6 +99,7 @@ public final class Scheduler {
         this.threadPoolManager = new ThreadPoolManager();
         this.tpsMonitor = new TPSMonitor(plugin);
         this.memoryMonitor = new MemoryMonitor(threadPoolManager.getScheduledPool());
+        this.threadPoolOrchestrator = new ThreadPoolOrchestrator(plugin, threadPoolManager, tpsMonitor, memoryMonitor);
 
         // Initialize execution strategies
         this.syncExecutor = new SyncExecutor(plugin);
@@ -98,6 +116,12 @@ public final class Scheduler {
         this.taskPrioritizer = new TaskPrioritizer(tpsMonitor);
         this.loadBalancer = new LoadBalancer(threadPoolManager, tpsMonitor);
         this.adaptiveTiming = new AdaptiveTiming(tpsMonitor, memoryMonitor);
+        this.hotPathOptimizer = new HotPathOptimizer();
+        this.localityOptimizer = new TaskLocalityOptimizer();
+        this.pluginBalancer = new PluginAwareBalancer();
+        this.taskCheckpointing = new TaskCheckpointing();
+        this.predictiveScheduler = new PredictiveScheduler(plugin, tpsMonitor);
+        this.taskCoalescer = new TaskCoalescer(this::executeBatchTasks);
 
         // Initialize metrics components
         this.schedulerMetrics = new SchedulerMetrics(plugin);
@@ -161,6 +185,18 @@ public final class Scheduler {
         // Clean up load balancer resources every 10 minutes
         runTimer(() -> loadBalancer.cleanupResources(), 10 * 60 * 20, 10 * 60 * 20);
 
+        // Adjust thread pool sizes dynamically every minute
+        runTimer(() -> threadPoolOrchestrator.adjustPoolSizes(), 60 * 20, 60 * 20);
+
+        // Balance plugin quotas every 30 seconds
+        runTimer(() -> pluginBalancer.balanceQuotas(), 30 * 20, 30 * 20);
+
+        // Clean up stale locality groups every 2 minutes
+        runTimer(() -> localityOptimizer.cleanupStaleGroups(), 2 * 60 * 20, 2 * 60 * 20);
+
+        // Record server load for predictive scheduling every minute
+        runTimer(() -> predictiveScheduler.recordCurrentLoad(), 20, 60 * 20);
+
         // Schedule metrics export if enabled
         if (plugin.getConfig().getBoolean("scheduler.metrics.export", false)) {
             String exportPath = plugin.getConfig().getString("scheduler.metrics.path", "metrics");
@@ -178,6 +214,15 @@ public final class Scheduler {
     public Task runSync(Runnable task) {
         long startTime = System.nanoTime();
         try {
+            // Check plugin quota
+            String pluginName = plugin.getName();
+            if (!pluginBalancer.canScheduleTask(pluginName)) {
+                Debug.log(Level.WARNING, "Plugin " + pluginName + " exceeded task quota, delaying task");
+                return runLater(task, 20); // Delay by 1 second
+            }
+
+            pluginBalancer.registerTaskStart(pluginName);
+
             // Track metrics
             Consumer<Long> completion = schedulerMetrics.taskStarted("sync");
 
@@ -190,8 +235,15 @@ public final class Scheduler {
                     if (completion != null) {
                         completion.accept(execTime);
                     }
+
+                    // Record execution for hot path optimization
+                    hotPathOptimizer.recordExecution("sync", execTime);
+
+                    // Register task completion with plugin balancer
+                    pluginBalancer.registerTaskComplete(pluginName, execTime);
                 } catch (Throwable t) {
                     schedulerMetrics.recordTaskFailed("sync", t);
+                    pluginBalancer.registerTaskFailure(pluginName);
                     throw t;
                 }
             });
@@ -233,12 +285,35 @@ public final class Scheduler {
     public Task runAsync(Runnable task, boolean isCpuIntensive, boolean isIoIntensive) {
         long startTime = System.nanoTime();
         try {
+            // Check plugin quota
+            String pluginName = plugin.getName();
+            if (!pluginBalancer.canScheduleTask(pluginName)) {
+                Debug.log(Level.WARNING, "Plugin " + pluginName + " exceeded task quota, delaying task");
+                return runLaterAsync(task, 20); // Delay by 1 second
+            }
+
+            pluginBalancer.registerTaskStart(pluginName);
+
             // Track metrics
             Consumer<Long> completion = schedulerMetrics.taskStarted("async");
 
             // Get appropriate executor based on task characteristics
-            ExecutorService executor = loadBalancer.getExecutorFor(
+            ExecutorService executor = threadPoolOrchestrator.getOptimalExecutor(
                     isCpuIntensive, isIoIntensive, false);
+
+            // Check for hot path optimization
+            String taskSignature = HotPathOptimizer.createTaskSignature("async",
+                    (isCpuIntensive ? "cpu" : "") + (isIoIntensive ? "io" : ""));
+
+            if (hotPathOptimizer.isHotPath(taskSignature)) {
+                // This is a hot path, use optimized execution
+                HotPathOptimizer.ExecutionMode mode = hotPathOptimizer.getRecommendedMode(taskSignature);
+
+                if (mode == HotPathOptimizer.ExecutionMode.BATCH) {
+                    // Execute as part of a batch
+                    return runBatch(task, "hot-" + taskSignature);
+                }
+            }
 
             // Execute the task
             Task scheduledTask = taskManager.runAsync(() -> {
@@ -249,8 +324,15 @@ public final class Scheduler {
                     if (completion != null) {
                         completion.accept(execTime);
                     }
+
+                    // Record execution for hot path optimization
+                    hotPathOptimizer.recordExecution(taskSignature, execTime);
+
+                    // Register task completion with plugin balancer
+                    pluginBalancer.registerTaskComplete(pluginName, execTime);
                 } catch (Throwable t) {
                     schedulerMetrics.recordTaskFailed("async", t);
+                    pluginBalancer.registerTaskFailure(pluginName);
                     throw t;
                 }
             });
@@ -288,11 +370,32 @@ public final class Scheduler {
                 Debug.debug("Adjusted delay from " + delayTicks + " to " + adjustedDelay + " ticks");
             }
 
+            // Check for predictive scheduling opportunities
+            String taskType = "runLater";
+            int recommendedDelay = predictiveScheduler.recommendForTaskType(taskType, 0.5);
+            if (recommendedDelay > 0 && recommendedDelay * 20 > adjustedDelay) {
+                // Use the predicted optimal time if it's later than the requested time
+                adjustedDelay = recommendedDelay * 20;
+                Debug.debug("Using predictive scheduling: adjusted delay to " + adjustedDelay + " ticks");
+            }
+
+            // Register with plugin balancer (deferred until execution)
+            String pluginName = plugin.getName();
+
             // Track metrics
             Consumer<Long> completion = schedulerMetrics.taskStarted("later");
 
             // Execute the task
             Task scheduledTask = taskManager.runLater(() -> {
+                // Check plugin quota right before execution
+                if (!pluginBalancer.canScheduleTask(pluginName)) {
+                    // Try again later
+                    runLater(task, 20);
+                    return;
+                }
+
+                pluginBalancer.registerTaskStart(pluginName);
+
                 long startTime = System.nanoTime();
                 try {
                     task.run();
@@ -300,8 +403,15 @@ public final class Scheduler {
                     if (completion != null) {
                         completion.accept(execTime);
                     }
+
+                    // Record execution for future prediction
+                    predictiveScheduler.recordTaskExecution(taskType, execTime);
+
+                    // Register task completion with plugin balancer
+                    pluginBalancer.registerTaskComplete(pluginName, execTime);
                 } catch (Throwable t) {
                     schedulerMetrics.recordTaskFailed("later", t);
+                    pluginBalancer.registerTaskFailure(pluginName);
                     throw t;
                 }
             }, adjustedDelay);
@@ -329,11 +439,23 @@ public final class Scheduler {
             // Check if we should adjust delay based on server load
             long adjustedDelay = adaptiveTiming.getAdjustedDelay(delayTicks, "later-async");
 
+            // Register with plugin balancer (deferred until execution)
+            String pluginName = plugin.getName();
+
             // Track metrics
             Consumer<Long> completion = schedulerMetrics.taskStarted("later-async");
 
             // Execute the task
             Task scheduledTask = taskManager.runLaterAsync(() -> {
+                // Check plugin quota right before execution
+                if (!pluginBalancer.canScheduleTask(pluginName)) {
+                    // Try again later
+                    runLaterAsync(task, 20);
+                    return;
+                }
+
+                pluginBalancer.registerTaskStart(pluginName);
+
                 long startTime = System.nanoTime();
                 try {
                     task.run();
@@ -341,8 +463,12 @@ public final class Scheduler {
                     if (completion != null) {
                         completion.accept(execTime);
                     }
+
+                    // Register task completion with plugin balancer
+                    pluginBalancer.registerTaskComplete(pluginName, execTime);
                 } catch (Throwable t) {
                     schedulerMetrics.recordTaskFailed("later-async", t);
+                    pluginBalancer.registerTaskFailure(pluginName);
                     throw t;
                 }
             }, adjustedDelay);
@@ -372,11 +498,23 @@ public final class Scheduler {
             long adjustedDelay = adaptiveTiming.getAdjustedDelay(delayTicks, "timer");
             long adjustedPeriod = adaptiveTiming.getAdjustedPeriod(periodTicks, "timer");
 
+            // Register with plugin balancer
+            String pluginName = plugin.getName();
+
             // Track metrics
             String category = "timer";
 
             // Execute the task
             Task scheduledTask = taskManager.runTimer(() -> {
+                // Check plugin quota
+                if (!pluginBalancer.canScheduleTask(pluginName)) {
+                    // Skip this execution but don't cancel
+                    Debug.debug("Skipping timer execution due to plugin quota");
+                    return;
+                }
+
+                pluginBalancer.registerTaskStart(pluginName);
+
                 Consumer<Long> completion = schedulerMetrics.taskStarted(category);
                 long startTime = System.nanoTime();
                 try {
@@ -388,8 +526,12 @@ public final class Scheduler {
 
                     // Record timing for future adjustments
                     adaptiveTiming.recordExecutionTime(category, execTime);
+
+                    // Register task completion with plugin balancer
+                    pluginBalancer.registerTaskComplete(pluginName, execTime);
                 } catch (Throwable t) {
                     schedulerMetrics.recordTaskFailed(category, t);
+                    pluginBalancer.registerTaskFailure(pluginName);
                     throw t;
                 }
             }, adjustedDelay, adjustedPeriod);
@@ -419,11 +561,23 @@ public final class Scheduler {
             long adjustedDelay = adaptiveTiming.getAdjustedDelay(delayTicks, "timer-async");
             long adjustedPeriod = adaptiveTiming.getAdjustedPeriod(periodTicks, "timer-async");
 
+            // Register with plugin balancer
+            String pluginName = plugin.getName();
+
             // Track metrics
             String category = "timer-async";
 
             // Execute the task
             Task scheduledTask = taskManager.runTimerAsync(() -> {
+                // Check plugin quota
+                if (!pluginBalancer.canScheduleTask(pluginName)) {
+                    // Skip this execution but don't cancel
+                    Debug.debug("Skipping async timer execution due to plugin quota");
+                    return;
+                }
+
+                pluginBalancer.registerTaskStart(pluginName);
+
                 Consumer<Long> completion = schedulerMetrics.taskStarted(category);
                 long startTime = System.nanoTime();
                 try {
@@ -435,8 +589,12 @@ public final class Scheduler {
 
                     // Record timing for future adjustments
                     adaptiveTiming.recordExecutionTime(category, execTime);
+
+                    // Register task completion with plugin balancer
+                    pluginBalancer.registerTaskComplete(pluginName, execTime);
                 } catch (Throwable t) {
                     schedulerMetrics.recordTaskFailed(category, t);
+                    pluginBalancer.registerTaskFailure(pluginName);
                     throw t;
                 }
             }, adjustedDelay, adjustedPeriod);
@@ -461,6 +619,17 @@ public final class Scheduler {
      */
     public Task runBatch(Runnable task, String batchName) {
         try {
+            // Register with plugin balancer
+            String pluginName = plugin.getName();
+
+            // Check plugin quota
+            if (!pluginBalancer.canScheduleTask(pluginName)) {
+                Debug.log(Level.WARNING, "Plugin " + pluginName + " exceeded task quota, delaying batch task");
+                return runLaterAsync(() -> runBatch(task, batchName), 20); // Delay by 1 second
+            }
+
+            pluginBalancer.registerTaskStart(pluginName);
+
             // Track metrics
             Consumer<Long> completion = schedulerMetrics.taskStarted("batch");
 
@@ -473,8 +642,12 @@ public final class Scheduler {
                     if (completion != null) {
                         completion.accept(execTime);
                     }
+
+                    // Register task completion with plugin balancer
+                    pluginBalancer.registerTaskComplete(pluginName, execTime);
                 } catch (Throwable t) {
                     schedulerMetrics.recordTaskFailed("batch", t);
+                    pluginBalancer.registerTaskFailure(pluginName);
                     throw t;
                 }
             };
@@ -495,6 +668,28 @@ public final class Scheduler {
     }
 
     /**
+     * Executes a list of tasks as a batch.
+     * This is used by the task coalescer.
+     *
+     * @param tasks The list of tasks to execute
+     */
+    private void executeBatchTasks(List<Runnable> tasks) {
+        if (tasks.isEmpty()) {
+            return;
+        }
+
+        runAsync(() -> {
+            for (Runnable task : tasks) {
+                try {
+                    task.run();
+                } catch (Exception e) {
+                    Debug.log(Level.SEVERE, "Error executing coalesced task: " + e.getMessage());
+                }
+            }
+        });
+    }
+
+    /**
      * Runs a task with a specific priority.
      *
      * @param task The task to run
@@ -503,6 +698,18 @@ public final class Scheduler {
      */
     public Task runPrioritized(Runnable task, Priority priority) {
         try {
+            // Register with plugin balancer
+            String pluginName = plugin.getName();
+
+            // Check plugin quota - only apply to lower priorities
+            if (priority != Priority.CRITICAL && !pluginBalancer.canScheduleTask(pluginName)) {
+                Debug.log(Level.WARNING, "Plugin " + pluginName + " exceeded task quota, reducing priority");
+                // Run with reduced priority instead of delaying
+                priority = getPriorityBelow(priority);
+            }
+
+            pluginBalancer.registerTaskStart(pluginName);
+
             // Track metrics
             Consumer<Long> completion = schedulerMetrics.taskStarted("prioritized");
 
@@ -518,8 +725,12 @@ public final class Scheduler {
                         if (completion != null) {
                             completion.accept(execTime);
                         }
+
+                        // Register task completion with plugin balancer
+                        pluginBalancer.registerTaskComplete(pluginName, execTime);
                     } catch (Throwable t) {
                         schedulerMetrics.recordTaskFailed("prioritized", t);
+                        pluginBalancer.registerTaskFailure(pluginName);
                         throw t;
                     }
                 });
@@ -533,8 +744,12 @@ public final class Scheduler {
                         if (completion != null) {
                             completion.accept(execTime);
                         }
+
+                        // Register task completion with plugin balancer
+                        pluginBalancer.registerTaskComplete(pluginName, execTime);
                     } catch (Throwable t) {
                         schedulerMetrics.recordTaskFailed("prioritized", t);
+                        pluginBalancer.registerTaskFailure(pluginName);
                         throw t;
                     }
                 });
@@ -552,6 +767,38 @@ public final class Scheduler {
             schedulerMetrics.recordTaskFailed("prioritized", e);
             return null;
         }
+    }
+
+    /**
+     * Gets the next lower priority level.
+     *
+     * @param priority The current priority
+     * @return The next lower priority, or LOWEST if already at the bottom
+     */
+    private Priority getPriorityBelow(Priority priority) {
+        switch (priority) {
+            case CRITICAL:
+                return Priority.HIGH;
+            case HIGH:
+                return Priority.NORMAL;
+            case NORMAL:
+                return Priority.LOW;
+            case LOW:
+            case LOWEST:
+            default:
+                return Priority.LOWEST;
+        }
+    }
+
+    /**
+     * Coalesces small similar tasks to reduce overhead.
+     *
+     * @param task The task to run
+     * @param taskType The type of task for coalescing
+     * @return A task representing the coalesced operation
+     */
+    public Task runCoalesced(Runnable task, String taskType) {
+        return taskCoalescer.scheduleTask(task, taskType);
     }
 
     /**
@@ -597,6 +844,9 @@ public final class Scheduler {
             // Adjust check interval based on server load
             long adjustedInterval = adaptiveTiming.getAdjustedPeriod(checkIntervalTicks, "conditional");
 
+            // Register with plugin balancer
+            String pluginName = plugin.getName();
+
             // Track metrics
             String category = "conditional";
 
@@ -604,6 +854,13 @@ public final class Scheduler {
             Task scheduledTask = runTimer(() -> {
                 try {
                     if (condition.get()) {
+                        // Check plugin quota before actual execution
+                        if (!pluginBalancer.canScheduleTask(pluginName)) {
+                            // Skip this execution
+                            return;
+                        }
+
+                        pluginBalancer.registerTaskStart(pluginName);
                         Consumer<Long> completion = schedulerMetrics.taskStarted(category);
                         long startTime = System.nanoTime();
 
@@ -614,8 +871,12 @@ public final class Scheduler {
                             if (completion != null) {
                                 completion.accept(execTime);
                             }
+
+                            // Register task completion with plugin balancer
+                            pluginBalancer.registerTaskComplete(pluginName, execTime);
                         } catch (Throwable t) {
                             schedulerMetrics.recordTaskFailed(category, t);
+                            pluginBalancer.registerTaskFailure(pluginName);
                             throw t;
                         }
                     }
@@ -672,6 +933,9 @@ public final class Scheduler {
      */
     public Task runWithResource(Runnable task, String resourceName) {
         try {
+            // Register with plugin balancer
+            String pluginName = plugin.getName();
+
             // Track metrics
             Consumer<Long> completion = schedulerMetrics.taskStarted("resource");
 
@@ -680,6 +944,14 @@ public final class Scheduler {
 
             // Create the wrapped task
             Runnable resourceTask = () -> {
+                // Check plugin quota
+                if (!pluginBalancer.canScheduleTask(pluginName)) {
+                    // Skip and try again later
+                    return;
+                }
+
+                pluginBalancer.registerTaskStart(pluginName);
+
                 // Acquire resource
                 loadBalancer.startUsingResource(resourceName);
 
@@ -694,9 +966,13 @@ public final class Scheduler {
 
                     // Track resource usage time
                     loadBalancer.finishUsingResource(resourceName, execTime);
+
+                    // Register task completion with plugin balancer
+                    pluginBalancer.registerTaskComplete(pluginName, execTime);
                 } catch (Throwable t) {
                     schedulerMetrics.recordTaskFailed("resource", t);
                     loadBalancer.finishUsingResource(resourceName, System.nanoTime() - startTime);
+                    pluginBalancer.registerTaskFailure(pluginName);
                     throw t;
                 }
             };
@@ -713,6 +989,35 @@ public final class Scheduler {
             schedulerMetrics.recordTaskFailed("resource", e);
             return null;
         }
+    }
+
+    /**
+     * Runs a task with data locality awareness for better cache efficiency.
+     *
+     * @param task The task to run
+     * @param localityKey A key identifying the data region this task operates on
+     * @return A cancellable task handle
+     */
+    public Task runWithLocality(Runnable task, String localityKey) {
+        // Use the task locality optimizer to improve cache efficiency
+        return localityOptimizer.scheduleLocalityAware(task, localityKey);
+    }
+
+    /**
+     * Creates a checkpointable task that can be resumed if interrupted.
+     *
+     * @param <T> The state type
+     * @param taskId A unique ID for the task
+     * @param initialState The initial state, or null to use last checkpoint
+     * @param processor Function to process the state and return a new state
+     * @return A runnable that will run the checkpointable task
+     */
+    public <T> Runnable createCheckpointableTask(
+            long taskId,
+            Supplier<T> initialState,
+            Function<T, T> processor) {
+
+        return taskCheckpointing.createCheckpointableTask(taskId, initialState, processor);
     }
 
     /**
@@ -760,6 +1065,7 @@ public final class Scheduler {
     public void cancelAllTasks() {
         taskManager.cancelAllTasks();
         chainExecutor.cancelAllChains();
+        taskCoalescer.flushAllTasks(); // Execute any pending coalesced tasks
     }
 
     /**
@@ -790,6 +1096,15 @@ public final class Scheduler {
     }
 
     /**
+     * Gets plugin resource utilization statistics.
+     *
+     * @return A map of plugin statistics
+     */
+    public Map<String, Map<String, Object>> getPluginStats() {
+        return pluginBalancer.getPluginStatistics();
+    }
+
+    /**
      * Displays metrics in-game to a command sender.
      *
      * @param sender The command sender to display metrics to
@@ -804,6 +1119,12 @@ public final class Scheduler {
      */
     public void shutdown() {
         Debug.log(Level.INFO, "Shutting down Scheduler");
+
+        // Execute all pending tasks with locality
+        localityOptimizer.executeAllPending();
+
+        // Execute any pending coalesced tasks
+        taskCoalescer.flushAllTasks();
 
         // Cancel all tasks
         cancelAllTasks();

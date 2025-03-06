@@ -33,26 +33,37 @@ public final class ThreadPoolManager {
     private final Map<PoolType, ExecutorService> pools;
     private final ScheduledExecutorService scheduledPool;
 
+    // Track initial pool sizes for resizing
+    private final Map<PoolType, Integer> poolSizes;
+
     /**
      * Creates a new ThreadPoolManager with optimized pools.
      */
     public ThreadPoolManager() {
         pools = new ConcurrentHashMap<>();
+        poolSizes = new ConcurrentHashMap<>();
 
         // Initialize pools with appropriate configurations
 
         // I/O-bound pool: More threads since they spend time waiting
+        int ioBoundSize = CPU_CORES * 4;
         pools.put(PoolType.IO_BOUND, createIoBoundPool());
+        poolSizes.put(PoolType.IO_BOUND, ioBoundSize / 2); // Initial core pool size
 
         // CPU-bound pool: Limited to CPU core count to avoid oversubscription
+        int cpuBoundSize = CPU_CORES;
         pools.put(PoolType.CPU_BOUND, createCpuBoundPool());
+        poolSizes.put(PoolType.CPU_BOUND, cpuBoundSize);
 
         // Low-latency pool: Thread-per-task to minimize startup delay
         pools.put(PoolType.LOW_LATENCY, createLowLatencyPool());
+        poolSizes.put(PoolType.LOW_LATENCY, 0); // Dynamic size for cached pool
 
         // Scheduled pool for timed tasks
+        int scheduledSize = Math.max(2, CPU_CORES / 2);
         this.scheduledPool = createScheduledPool();
         pools.put(PoolType.SCHEDULED, scheduledPool);
+        poolSizes.put(PoolType.SCHEDULED, scheduledSize);
 
         // Start monitoring thread
         startMonitoring();
@@ -75,6 +86,50 @@ public final class ThreadPoolManager {
      */
     public ScheduledExecutorService getScheduledPool() {
         return scheduledPool;
+    }
+
+    /**
+     * Gets the current size of a thread pool.
+     *
+     * @param type The pool type
+     * @return The current pool size, or -1 if unknown
+     */
+    public int getPoolSize(PoolType type) {
+        ExecutorService pool = pools.get(type);
+        if (pool instanceof ThreadPoolExecutor) {
+            return ((ThreadPoolExecutor) pool).getPoolSize();
+        } else {
+            return poolSizes.getOrDefault(type, -1);
+        }
+    }
+
+    /**
+     * Resizes a thread pool.
+     *
+     * @param type The pool type to resize
+     * @param newSize The new core pool size
+     * @return true if resized successfully, false otherwise
+     */
+    public boolean resizePool(PoolType type, int newSize) {
+        ExecutorService pool = pools.get(type);
+        if (pool instanceof ThreadPoolExecutor) {
+            ThreadPoolExecutor executor = (ThreadPoolExecutor) pool;
+
+            // Store the new size
+            poolSizes.put(type, newSize);
+
+            // Adjust core pool size - this affects the minimum number of threads kept alive
+            executor.setCorePoolSize(newSize);
+
+            // If it's an I/O pool, we might want to adjust max size too
+            if (type == PoolType.IO_BOUND) {
+                executor.setMaximumPoolSize(Math.max(newSize, newSize * 2)); // Allow 2x growth
+            }
+
+            Debug.debug("Resized " + type + " pool to " + newSize + " threads");
+            return true;
+        }
+        return false;
     }
 
     /**
