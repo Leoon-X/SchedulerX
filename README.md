@@ -213,15 +213,38 @@ Or include the JAR file in your plugin.
 Access performance metrics:
 
 ```java
-// In-game command
-// /scheduler metrics
+// Get plugin-specific statistics
+Map<String, Map<String, Object>> pluginStats = scheduler.getPluginStats();
+// This shows per-plugin metrics including:
+// - Active task count
+// - Completed task count
+// - Failed task count
+// - Average execution time
+// - Task quotas
+// - Resource utilization
 
-// Export HTML report
-scheduler.getMetricsExporter().exportToHtml(new File("metrics.html"));
+// Get thread pool performance metrics
+int cpuPoolSize = scheduler.threadPoolManager.getPoolSize(ThreadPoolManager.PoolType.CPU_BOUND);
+int ioPoolSize = scheduler.threadPoolManager.getPoolSize(ThreadPoolManager.PoolType.IO_BOUND);
 
-// Get programmatic access
-SchedulerMetrics metrics = scheduler.getMetrics();
-double avgExecutionTime = metrics.getAverageExecutionTimeNanos("database") / 1_000_000.0;
+// Check if a plugin is causing issues
+boolean isProblematic = scheduler.pluginBalancer.isPluginProblematic("PluginName");
+
+// Get hot path analytics
+// (identify frequently executed code paths)
+HotPathOptimizer.OptimizedTaskInfo hotPathInfo = 
+    scheduler.hotPathOptimizer.getOptimizationInfo("taskType");
+if (hotPathInfo != null) {
+    double avgExecTime = hotPathInfo.getAverageExecutionTimeNanos() / 1_000_000.0;
+    System.out.println("Hot path average execution time: " + avgExecTime + "ms");
+}
+
+// Get predictive model accuracy
+double modelAccuracy = scheduler.predictiveScheduler.getModelAccuracy();
+System.out.println("Prediction model accuracy: " + modelAccuracy + "%");
+
+// Export all enhanced metrics to HTML with new visualizations
+scheduler.getMetricsExporter().exportToHtml(new File("advanced-metrics.html"));
 ```
 
 ## 🔍 Why It's Special
